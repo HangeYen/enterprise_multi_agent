@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <title>Enterprise Multi-Agent Chat</title>
+</head>
+<body>
+    <h1>Enterprise Multi-Agent Chat</h1>
+    <textarea id="question" rows="4" cols="60"></textarea><br />
+    <button onclick="send()">Send</button>
+    <pre id="answer"></pre>
+
+    <script>
+        function send() {
+            const q = document.getElementById("question").value;
+            fetch("/ask", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({question: q})
+            }).then(r => r.json()).then(data => {
+                document.getElementById("answer").innerText = data.answer;
+            });
+        }
+    </script>
+</body>
+</html>
