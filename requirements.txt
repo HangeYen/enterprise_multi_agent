@@ -5,6 +5,7 @@ langchain>=1.0.0
 langgraph>=1.0.0
 langchain-openai>=0.0.8
 langsmith>=0.1.0
+openai>=1.58.1
 
 # ===============================
 # Web Server (RWD Portal)
