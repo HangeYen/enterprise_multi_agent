@@ -1,5 +1,5 @@
-from typing import Dict, Any
-
+# agents/db_agent.py
+from typing import Dict, Any, List, Optional
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -7,44 +7,45 @@ logger = get_logger(__name__)
 
 class DatabaseAgent:
     """
-    Database Agent
+    Database / BI Agent（示範版）
 
-    負責：
-    - 接收自然語言問題
-    - 轉換成 SQL（未來可接 LangChain Text-to-SQL）
-    - 呼叫 MCP Server 中的 SQL 工具與 Chart 工具
-    - 回傳表格與圖表 URL 給上游 Supervisor
+    - question: 使用者原始問題
+    - slots: Supervisor 抽出的語意欄位（例如 metrics / period）
 
-    目前仍使用假資料，以方便先跑通 Multi-Agent 流程。
+    回傳格式：
+    {
+        "ok": True,
+        "query": {...},       # 實際查詢條件（示範）
+        "rows": [...],        # 查詢結果（示範）
+        "message": "可直接給使用者看的說明文字"
+    }
     """
 
-    def __init__(self) -> None:
-        # 未來可注入 MCP client 或 LangChain Chain
-        pass
+    def run(self, question: str, slots: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        logger.info("DatabaseAgent received question=%s, slots=%s", question, slots)
 
-    def run(self, question: str) -> Dict[str, Any]:
-        """
-        執行 Database Agent 主流程。
+        slots = slots or {}
+        metrics: List[str] = slots.get("metrics") or ["sales"]
+        period: Optional[str] = slots.get("period") or "last_month"
 
-        目前簡化為：
-        - log 問題
-        - 回傳假 rows + 假圖表 URL
-        """
-        logger.info("DatabaseAgent received question: %s", question)
+        # 這裡實務上應該組出 SQL / ORM 查詢條件
+        # 目前先用示範資料
+        query_conditions = {
+            "metrics": metrics,
+            "period": period,
+        }
 
-        # TODO：
-        # 1) 使用 LLM 產生 SQL
-        # 2) 經由 MCPServer.sql_query(sql) 執行查詢
-        # 3) 經由 MCPServer.chart_generate(rows) 產生圖表
-        dummy_rows = [
-            {"product": "A", "sales": 120},
-            {"product": "B", "sales": 200},
-            {"product": "C", "sales": 80},
-        ]
-        dummy_chart_url = "https://quickchart.io/chart?c={type:'bar',data:{labels:['A','B','C'],datasets:[{data:[120,200,80]}]}}"
+        # 假資料 rows
+        rows: List[Dict[str, Any]] = []
+
+        message = (
+            f"已根據條件 metrics={metrics}, period={period} 查詢銷售報表。"
+            f"（目前為示範用假資料，實務上請連接資料庫並格式化輸出。）"
+        )
 
         return {
-            "type": "db_result",
-            "rows": dummy_rows,
-            "chart_url": dummy_chart_url,
+            "ok": True,
+            "query": query_conditions,
+            "rows": rows,
+            "message": message,
         }

@@ -1,129 +1,82 @@
-from typing import Dict, Any, List
-
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_openai import AzureChatOpenAI, ChatOpenAI
-
-from configparser import ConfigParser
-
+# agents/doc_agent.py
+from typing import Dict, Any, Optional, List
 from utils.logger import get_logger
 from tools.vector_tools import vector_query
 
 logger = get_logger(__name__)
 
 
-def _load_llm_from_config(config_path: str = "config.ini"):
-    """
-    根據 config.ini 讀取 [LLM] + 對應 Provider 設定，建立 LLM 物件。
-
-    - provider = azure → 使用 AzureChatOpenAI
-    - provider = openai → 使用 ChatOpenAI
-    - provider = gemini → 可以留作未來擴充
-    """
-    cfg = ConfigParser()
-    cfg.read(config_path, encoding="utf-8")
-
-    provider = cfg.get("LLM", "provider", fallback="azure").lower()
-    temperature = cfg.getfloat("LLM", "temperature", fallback=0.2)
-
-    if provider == "azure":
-        endpoint = cfg.get("AZURE_OPENAI", "endpoint")
-        api_key = cfg.get("AZURE_OPENAI", "key")
-        deployment = cfg.get("AZURE_OPENAI", "deployment")
-        api_version = cfg.get("AZURE_OPENAI", "api_version")
-
-        llm = AzureChatOpenAI(
-            azure_endpoint=endpoint,
-            api_key=api_key,
-            azure_deployment=deployment,
-            api_version=api_version,
-            temperature=temperature,
-        )
-        return llm
-
-    if provider == "openai":
-        api_key = cfg.get("OPENAI", "api_key")
-        model = cfg.get("OPENAI", "model", fallback="gpt-4o-mini")
-        llm = ChatOpenAI(
-            api_key=api_key,
-            model=model,
-            temperature=temperature,
-        )
-        return llm
-
-    # 預設使用 azure，避免無法運行
-    endpoint = cfg.get("AZURE_OPENAI", "endpoint")
-    api_key = cfg.get("AZURE_OPENAI", "key")
-    deployment = cfg.get("AZURE_OPENAI", "deployment")
-    api_version = cfg.get("AZURE_OPENAI", "api_version")
-
-    return AzureChatOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        azure_deployment=deployment,
-        api_version=api_version,
-        temperature=temperature,
-    )
-
-
 class DocumentAgent:
     """
-    Document Agent
+    文件 / 管理辦法 / SOP / 規範 查詢 Agent（slot-aware）
 
-    負責：
-    - 呼叫向量資料庫查詢相關文件片段（tools.vector_tools.vector_query）
-    - 使用 LangChain 建立簡單的 RAG Chain（context + question → answer）
+    支援欄位：
+    - metrics: 若使用者明確提到查詢 "啥內容"
+    - period: 查詢年度、版本（如：2024, 最近一年）
+    - date: 查詢某日期版本的制度
     """
 
-    def __init__(self, config_path: str = "config.ini") -> None:
-        self.config_path = config_path
-        self.llm = _load_llm_from_config(config_path)
+    def run(self, question: str, slots: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        logger.info("DocumentAgent received question=%s, slots=%s", question, slots)
 
-        # RAG Prompt 範例，可依企業風格修改
-        self.prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "你是一位企業內部知識庫助理，請依據提供的文件內容回答問題。"
-                    "若文件中沒有明確提到，請老實說不知道，不要捏造。",
-                ),
-                (
-                    "human",
-                    "以下是與問題相關的文件片段：\n\n{context}\n\n"
-                    "問題：{question}\n\n"
-                    "請以條列式輸出重點說明。",
-                ),
-            ]
-        )
-        self.chain = self.prompt | self.llm | StrOutputParser()
+        slots = slots or {}
 
-    def _build_context(self, docs: List[Dict[str, Any]]) -> str:
-        """
-        將 vector_query 回傳的多筆 file chunk 組成一個 context 字串。
-        """
-        contents = [d.get("content", "") for d in docs]
-        return "\n\n".join(contents)
+        # ----------- 從 slots 萃取參數 -----------
+        metrics = slots.get("metrics") or []
+        period = slots.get("period")
+        date = slots.get("date")
 
-    def run(self, question: str) -> Dict[str, Any]:
-        logger.info("DocumentAgent received question: %s", question)
+        # 組合查詢關鍵字（加入使用者原始 question）
+        query_terms: List[str] = [question]
+        query_terms.extend(metrics)
 
-        # 1) 向向量庫查詢相關文件 chunk
-        docs = vector_query(question)
-        context = self._build_context(docs)
+        if period:
+            query_terms.append(str(period))
+        if date:
+            query_terms.append(str(date))
 
-        if not context.strip():
-            dummy_answer = "目前文件庫中找不到與此問題相關的內容。"
+        final_query = " ".join(query_terms)
+        logger.info("DocumentAgent vector query terms=%s", final_query)
+
+        # ----------- Vector Search 查詢文件 -----------
+        try:
+            vec_result = vector_query(final_query)
+        except Exception as e:
+            logger.error("呼叫向量查詢失敗：%s", e)
             return {
-                "type": "doc_result",
-                "answer": dummy_answer,
-                "source_count": 0,
+                "ok": False,
+                "answer": "文件查詢系統無法使用，請稍後再試。",
+                "query": final_query,
+                "snippets": [],
             }
 
-        # 2) LangChain RAG Chain
-        answer = self.chain.invoke({"context": context, "question": question})
+        # 格式化向量回傳內容（擷取最相關片段）
+        snippets = [hit.get("content", "") for hit in vec_result][:3]
+
+        if not snippets:
+            return {
+                "ok": False,
+                "answer": "目前查不到相關管理辦法或制度。",
+                "query": final_query,
+                "snippets": [],
+            }
+
+        # ----------- 最終回答：取前三個片段組合 -----------
+        answer = self._format_answer(snippets)
 
         return {
-            "type": "doc_result",
+            "ok": True,
             "answer": answer,
-            "source_count": len(docs),
+            "query": final_query,
+            "snippets": snippets,
+            "slots": slots,
         }
+
+    # ------------------------------------------------------
+    # Answer Formatter（可依企業需求調整）
+    # ------------------------------------------------------
+    def _format_answer(self, snippets: List[str]) -> str:
+        lines = ["以下為文件管理辦法相關內容摘要：\n"]
+        for i, s in enumerate(snippets, 1):
+            lines.append(f"{i}. {s}\n")
+        return "\n".join(lines)
