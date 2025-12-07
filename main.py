@@ -533,7 +533,7 @@ def responder_node(state: EnterpriseState) -> EnterpriseState:
     # -------------------------------
     total = sum(usage.values())
     token_lines = [
-        f"Router = {usage.get('router', 0)}",
+        f"Supervisor = {usage.get('router', 0)}",
         f"Booking = {usage.get('booking', 0)}",
         f"DB = {usage.get('db', 0)}",
         f"Doc = {usage.get('doc', 0)}",
