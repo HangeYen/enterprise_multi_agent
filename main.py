@@ -1,16 +1,16 @@
 """
-main.py — Enterprise Multi-Agent Supervisor
+main.py — Enterprise Multi-Agent Supervisor v9.7
+
 功能重點：
 - LangGraph 1.0 + MemorySaver：使用 LangGraph state 做多輪記憶
-- 完全移除自訂 session dict，全靠 thread_id + checkpoint 維持 state
+    - 完全移除自訂 session dict，全靠 thread_id + checkpoint 維持 state
 - Semantic Router（LLM + PydanticOutputParser）+ robust JSON cleaner
 - Hybrid Router（LLM route + keyword fallback + multi-route）
 - Slot-aware Supervisor（date/time/people/metrics/period）
 - 會議室 OA slots（date/time/people）跨輪延續與更新
-    - 整合 BookingAgent v2：真正依據 slots.time / slots.date / slots.people 產生會議時間區間
-- Multi-Agent Orchestrator（async + concurrency；booking / db / doc multi tasks）
-- Responder 統一彙整多 Agent 結果
-- Token Logging：Router + DB + Doc + Booking（OpenAI SDK for Azure Token + LangGraph + Multi-Agent)
+    - 整合 BookingAgent：依據 slots.date / slots.time / slots.people 產生會議時間區間
+- Multi-Agent Orchestrator（async + concurrency；booking / db / doc multi tasks at the same time）
+- Responder 統一彙整多 Agent 結果 + Token Logging
 """
 
 import asyncio
@@ -45,7 +45,7 @@ logger = get_logger(__name__)
 
 
 # ================================================================
-# OpenAI SDK (Azure 模式) 初始化 — v9.6
+# OpenAI SDK (Azure 模式) 初始化 — v9.7
 # ================================================================
 def init_azure_openai_client():
     """
@@ -104,7 +104,7 @@ WEEKDAY_MAP = {
 def _next_weekday_after_now(weekday: int) -> datetime:
     """
     取得下一次指定星期幾（不包含今天）。
-    例如今天星期六，weekday=1(週一) → 下週一。
+    例如：今天星期六，weekday=1(週一) → 下週一。
     """
     now = datetime.now()
     diff = (weekday - now.weekday() + 7) % 7
@@ -143,6 +143,7 @@ def normalize_date(text: Optional[str]) -> Optional[str]:
             dt = _next_weekday_after_now(wd)
             return dt.strftime("%Y-%m-%d")
 
+    # 已經是 YYYY-MM-DD 的情況
     try:
         datetime.strptime(text, "%Y-%m-%d")
         return text
@@ -160,6 +161,9 @@ DATE_KEYWORDS = [
 
 
 def user_mentioned_date(text: str) -> bool:
+    """
+    粗略判斷使用者是否有提到日期相關字詞（自然語意）。
+    """
     return any(k in text for k in DATE_KEYWORDS)
 
 
@@ -167,6 +171,10 @@ def user_mentioned_date(text: str) -> bool:
 # Router Schema
 # ================================================================
 class SlotModel(BaseModel):
+    """
+    Supervisor 從使用者輸入抽取出的語意欄位。
+    提供給各 Agent 使用。
+    """
     date: Optional[str] = None
     time: Optional[str] = None
     people: Optional[int] = None
@@ -175,6 +183,10 @@ class SlotModel(BaseModel):
 
 
 class RouterOutput(BaseModel):
+    """
+    Semantic Router 的結構化輸出。
+    route：booking / db / doc / none
+    """
     route: Literal["booking", "db", "doc", "none"]
     confidence: float
     slots: Optional[SlotModel] = None
@@ -196,7 +208,7 @@ router_prompt = ChatPromptTemplate.from_messages(
 {format_instructions}
 
 規則：
-- date：只能輸出語意日期（今天、明天、後天、下星期一 等），不要輸出 YYYY-MM-DD。
+- date：只能輸出語意日期（今天、明天、後天、下星期一 等），或使用者原始輸入的日期字串（例如 12/30），不要自行轉成 YYYY-MM-DD。
 - time：自然語意或 HH:MM。
 - people：整數或 null。
 - route：booking / db / doc / none。
@@ -214,6 +226,12 @@ router_prompt = ChatPromptTemplate.from_messages(
 # JSON 清理
 # ================================================================
 def clean_llm_output(text: str) -> str:
+    """
+    將 LLM 回傳的文字清理成純 JSON 字串：
+    - 去掉 ```json ... ``` 區塊
+    - 若前面有 json 字樣，移除
+    - 擷取第一個 {...} 區塊
+    """
     t = text.strip()
 
     if t.startswith("```"):
@@ -234,6 +252,11 @@ def clean_llm_output(text: str) -> str:
 # Semantic Router（Azure ChatCompletion + Token）
 # ================================================================
 def semantic_route(user_text: str) -> RouterOutput:
+    """
+    透過 Azure OpenAI + Pydantic parser 做語意路由。
+    並記錄 Token 使用量於 semantic_route.last_usage。
+    """
+    # LangChain ChatPromptTemplate → 轉換成 OpenAI SDK messages
     lc_msgs = router_prompt.format_messages(input=user_text)
 
     api_msgs: List[Dict[str, str]] = []
@@ -280,14 +303,18 @@ def semantic_route(user_text: str) -> RouterOutput:
 # ================================================================
 BOOKING_KW = ["會議室", "預約", "開會"]
 DB_KW = ["銷售", "報表", "統計", "營收", "kpi", "分析"]
-DOC_KW = ["出差", "辦法", "制度", "流程", "規範", "報帳", "SOP", "請假",
-    "出勤", "合約", "合約書", "文件", "手冊", "指南", "政策",
-    "規定", "準則", "條款", "條例", "法規",
-    # HR / 勞動法務關鍵字(新增),
-    "資遣", "解僱", "終止契約", "遣散", "裁員", "離職"]
+DOC_KW = [
+    "出差", "辦法", "制度", "流程", "規範", "報帳", "SOP", "請假", "出勤",
+    "合約", "合約書", "文件", "手冊", "指南", "政策", "規定", "準則",
+    "條款", "條例", "法規",
+]
 
 
 def keyword_router(text: str) -> str:
+    """
+    傳統關鍵字路由：
+    - booking / db / doc / none
+    """
     t = text.lower()
     if any(k in t for k in BOOKING_KW):
         return "booking"
@@ -302,6 +329,11 @@ def keyword_router(text: str) -> str:
 # Multi-route 判斷
 # ================================================================
 def detect_all_routes(text: str, primary: str) -> List[str]:
+    """
+    依據 primary route + 關鍵字，再偵測所有可能需要執行的任務：
+    - booking / db / doc 可能同時存在
+    - 若最後為空 → 回傳 ["none"]
+    """
     routes: List[str] = []
     t = text.lower()
 
@@ -322,6 +354,12 @@ def detect_all_routes(text: str, primary: str) -> List[str]:
 # Hybrid Router（slots 永遠來自 semantic router）
 # ================================================================
 def classify_intent(text: str):
+    """
+    回傳：
+    - primary: 主要 route
+    - slots: SlotModel
+    - routes: 多個 route（booking / db / doc 同時可能存在）
+    """
     try:
         sem = semantic_route(text)
         slots = sem.slots
@@ -342,6 +380,16 @@ def classify_intent(text: str):
 # LangGraph State 定義
 # ================================================================
 class EnterpriseState(TypedDict):
+    """
+    LangGraph 全域狀態：
+    - messages：對話歷史
+    - route：主要 route
+    - routes：本輪要執行的所有 route
+    - slots：一般 slot（給 db/doc 等）
+    - oa_slots：會議室專用 slot（date/time/people）
+    - payload：各 Agent 回傳結果
+    - token_usage：Token 使用量紀錄
+    """
     messages: Annotated[List[AnyMessage], add_messages]
     route: str
     routes: List[str]
@@ -363,6 +411,12 @@ doc_agent = DocumentAgent()
 # Supervisor Node（路由 + slot merge）
 # ================================================================
 def supervisor_node(state: EnterpriseState) -> EnterpriseState:
+    """
+    主管節點：
+    - 呼叫 classify_intent → 取得 primary, slots, routes
+    - 處理日期 / 時間 / 人數 slot merge（跨輪 booking）
+    - 寫入 token_usage["Supervisor"]
+    """
     state.setdefault("payload", {})
     state.setdefault("slots", {})
     state.setdefault("oa_slots", {})
@@ -378,45 +432,68 @@ def supervisor_node(state: EnterpriseState) -> EnterpriseState:
     text = last.content
     logger.info("Supervisor 收到輸入：%s", text)
 
+    # 1. 語意路由 + slots
     primary, slot_obj, routes = classify_intent(text)
 
+    # 2. Token usage 記錄
     usage = getattr(semantic_route, "last_usage", {
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
     })
-    state["token_usage"]["router"] = usage.get("total_tokens", 0)
+    state["token_usage"]["Supervisor"] = usage.get("total_tokens", 0)
 
+    # 3. 日期處理與 booking slot merge
     date_explicit = user_mentioned_date(text)
     prev_oa = state["oa_slots"] or {}
-
     slots_dict = slot_obj.model_dump()
 
+    # --- 修正：MM/DD（12/30、12/17 等）優先視為使用者指定日期 ---
+    if slot_obj.date:
+        raw = slot_obj.date.strip()
+        normalized_date: Optional[str] = None
+
+        # Case 1: 明確 MM/DD 格式
+        if "/" in raw:
+            try:
+                dt = datetime.strptime(raw, "%m/%d")
+                normalized_date = dt.replace(year=datetime.now().year).strftime("%Y-%m-%d")
+            except ValueError:
+                normalized_date = None
+        else:
+            # Case 2: 自然語意日期（今天 / 明天 / 下星期二 ...）
+            if date_explicit:
+                normalized_date = normalize_date(raw)
+            else:
+                # Case 3: LLM 已經給 ISO（例如 2023-12-17）或未知字串，直接沿用
+                normalized_date = raw
+    else:
+        normalized_date = prev_oa.get("date")
+
+    merged_oa = {
+        "date": normalized_date,
+        "time": slot_obj.time or prev_oa.get("time"),
+        "people": slot_obj.people if slot_obj.people is not None else prev_oa.get("people"),
+    }
+    state["oa_slots"] = merged_oa
+
+    # 一般 slots 也要反映最新 oa_slots
+    slots_dict["date"] = merged_oa.get("date")
+    slots_dict["time"] = merged_oa.get("time")
+    slots_dict["people"] = merged_oa.get("people")
+    state["slots"] = slots_dict
+
+    # 4. 若 primary=none 但有歷史 booking slot + 新 booking 資訊 → 補上 booking route
     has_new_booking_info = (
-        (slot_obj.people is not None)
-        or (slot_obj.time is not None)
+        slot_obj.time is not None
+        or slot_obj.people is not None
         or (slot_obj.date is not None and date_explicit)
     )
 
     if primary == "none" and prev_oa and has_new_booking_info:
         primary = "booking"
-        routes = ["booking"]
-
-    if slot_obj.date and date_explicit:
-        normalized_date = normalize_date(slot_obj.date)
-    else:
-        normalized_date = None
-
-    merged_oa = {
-        "date": normalized_date or prev_oa.get("date"),
-        "time": slot_obj.time or prev_oa.get("time"),
-        "people": slot_obj.people if slot_obj.people is not None else prev_oa.get("people"),
-    }
-
-    state["oa_slots"] = merged_oa
-
-    slots_dict["date"] = merged_oa.get("date")
-    state["slots"] = slots_dict
+        if "booking" not in routes:
+            routes.append("booking")
 
     state["route"] = primary
     state["routes"] = routes
@@ -435,6 +512,11 @@ def supervisor_node(state: EnterpriseState) -> EnterpriseState:
 # Async Agent 子任務
 # ================================================================
 async def _run_booking(state: EnterpriseState):
+    """
+    Booking 子任務：
+    - 使用 oa_slots（date/time/people）
+    - 透過 asyncio.to_thread 包裝同步 Agent
+    """
     last_text = state["messages"][-1].content
     slots = state["oa_slots"]
 
@@ -445,13 +527,18 @@ async def _run_booking(state: EnterpriseState):
     msg = result.get("message", "已處理會議室相關需求。（示範）")
 
     usage_tokens = 0
-    if isinstance(result, dict):
+    if isinstance(result, Dict):
         usage_tokens = result.get("usage", {}).get("total_tokens", 0)
 
-    return {"booking": msg}, [AIMessage(content=msg)], usage_tokens
+    # 回傳：payload_delta, messages_delta, usage_tokens
+    return {"booking": msg}, [], usage_tokens
 
 
 async def _run_db(state: EnterpriseState):
+    """
+    DB / BI 子任務：
+    - 使用 slots（含 metrics / period / date 等）
+    """
     last_text = state["messages"][-1].content
     slots = state["slots"]
 
@@ -462,13 +549,17 @@ async def _run_db(state: EnterpriseState):
     msg = result.get("answer") or result.get("message") or "已完成資料庫查詢（示範）。"
 
     usage_tokens = 0
-    if isinstance(result, dict):
+    if isinstance(result, Dict):
         usage_tokens = result.get("usage", {}).get("total_tokens", 0)
 
-    return {"db": msg}, [AIMessage(content=msg)], usage_tokens
+    return {"db": msg}, [], usage_tokens
 
 
 async def _run_doc(state: EnterpriseState):
+    """
+    文件 / 管理辦法子任務：
+    - 使用 slots（含日期 / 主題等強化檢索）
+    """
     last_text = state["messages"][-1].content
     slots = state["slots"]
 
@@ -479,16 +570,26 @@ async def _run_doc(state: EnterpriseState):
     msg = result.get("answer") or result.get("message") or "已完成文件查詢（示範）。"
 
     usage_tokens = 0
-    if isinstance(result, dict):
+    if isinstance(result, Dict):
         usage_tokens = result.get("usage", {}).get("total_tokens", 0)
 
-    return {"doc": msg}, [AIMessage(content=msg)], usage_tokens
+    return {"doc": msg}, [], usage_tokens
 
 
 # ================================================================
 # Orchestrator Node（多 Agent 並行）
 # ================================================================
 async def agent_orchestrator_node(state: EnterpriseState) -> EnterpriseState:
+    """
+    依 state["routes"] 決定要啟動哪些 Agent：
+    - booking → _run_booking
+    - db → _run_db
+    - doc → _run_doc
+
+    使用 asyncio.gather 並行執行，將結果合併到：
+    - state["payload"]
+    - state["token_usage"]
+    """
     routes = state.get("routes", ["none"])
     logger.info("Orchestrator 收到 routes=%s", routes)
 
@@ -512,65 +613,80 @@ async def agent_orchestrator_node(state: EnterpriseState) -> EnterpriseState:
             continue
 
         payload_delta, msgs_delta, usage_tokens = res
-        key = list(payload_delta.keys())[0]
+        key = list(payload_delta.keys())[0]  # booking / db / doc
 
         state["payload"].update(payload_delta)
         state["messages"].extend(msgs_delta)
-        state["token_usage"][key] = usage_tokens
+
+        # Token Usage key 統一使用首字大寫版本
+        if key == "booking":
+            state["token_usage"]["Booking"] = usage_tokens
+        elif key == "db":
+            state["token_usage"]["DB"] = usage_tokens
+        elif key == "doc":
+            state["token_usage"]["Doc"] = usage_tokens
 
     return state
 
 
 # ================================================================
-# Responder Node（任務整合 + fallback 強化版）
+# Responder Node（結果彙整 + Token Summary）
 # ================================================================
 def responder_node(state: EnterpriseState) -> EnterpriseState:
+    """
+    多 Agent 任務結果的統一回覆：
+    - 若有 booking / db / doc payload → 組合成整合訊息
+    - 若 payload 為空 → 給出「沒有偵測到可處理的任務」提示
+    - 統一在尾端附上 Token 用量摘要
+    """
     payload = state.get("payload", {})
     usage = state.get("token_usage", {})
 
-    # -------------------------------
-    # 組合 Token 用量塊
-    # -------------------------------
-    total = sum(usage.values())
+    parts: List[str] = []
+
+    # 會議室預約
+    if "booking" in payload:
+        parts.append(f"【會議室預約】\n{payload['booking']}")
+
+    # 資料庫查詢
+    if "db" in payload:
+        parts.append(f"【資料庫查詢】\n{payload['db']}")
+
+    # 文件查詢
+    if "doc" in payload:
+        parts.append(f"【文件查詢】\n{payload['doc']}")
+
+    # 若沒有任何任務 → fallback 說明
+    if not parts:
+        fallback_msg = (
+            "目前沒有偵測到可處理的任務。\n"
+            "若需要查詢會議室 / 文件 / 資料庫，請提出具體需求。"
+        )
+        logger.info(
+            "Responder fallback：payload 為空 → %s",
+            fallback_msg.replace("\n", " "),
+        )
+        parts.append(fallback_msg)
+
+    # Token 用量摘要
+    total = (
+        usage.get("Supervisor", 0)
+        + usage.get("Booking", 0)
+        + usage.get("DB", 0)
+        + usage.get("Doc", 0)
+    )
     token_lines = [
-        f"Supervisor = {usage.get('router', 0)}",
-        f"Booking = {usage.get('booking', 0)}",
-        f"DB = {usage.get('db', 0)}",
-        f"Doc = {usage.get('doc', 0)}",
+        f"Supervisor = {usage.get('Supervisor', 0)}",
+        f"Booking = {usage.get('Booking', 0)}",
+        f"DB = {usage.get('DB', 0)}",
+        f"Doc = {usage.get('Doc', 0)}",
         f"Total = {total}",
     ]
-    token_block = "【Token 用量】\n" + "\n".join(token_lines)
+    parts.append("【Token 用量】\n" + "\n".join(token_lines))
 
-    # -------------------------------
-    # 是否有任務可彙整？
-    # -------------------------------
-    has_task = any(k in payload for k in ("booking", "db", "doc"))
-
-    if not has_task:
-        final_msg = (
-            "目前沒有偵測到可處理的任務。\n"
-            "若需要查詢會議室 / 文件 / 資料庫，請提出具體需求。\n\n"
-            + token_block
-        )
-    else:
-        parts = []
-        if "booking" in payload:
-            parts.append(f"【會議室預約】\n{payload['booking']}")
-        if "db" in payload:
-            parts.append(f"【資料庫查詢】\n{payload['db']}")
-        if "doc" in payload:
-            parts.append(f"【文件查詢】\n{payload['doc']}")
-        parts.append(token_block)
-        final_msg = "\n\n".join(parts)
-
-    # -------------------------------
-    # 覆蓋最後一則 AI 回覆（避免累加）
-    # -------------------------------
-    # 先把舊的 AI 回覆刪除，只保留 HumanMessage
-    state["messages"] = [m for m in state["messages"] if isinstance(m, HumanMessage)]
+    final_msg = "\n\n".join(parts)
     state["messages"].append(AIMessage(content=final_msg))
-
-    logger.info("Responder 完成，輸出單一回覆。")
+    logger.info("Responder 完成、輸出單一回覆。")
     return state
 
 
@@ -578,6 +694,10 @@ def responder_node(state: EnterpriseState) -> EnterpriseState:
 # LangGraph Workflow
 # ================================================================
 def build_graph() -> StateGraph:
+    """
+    LangGraph 流程：
+    START → supervisor → agents → responder → END
+    """
     g = StateGraph(EnterpriseState)
 
     g.add_node("supervisor", supervisor_node)
@@ -600,6 +720,11 @@ app = build_graph().compile(checkpointer=memory)
 # 對外 async 入口
 # ================================================================
 async def arun_supervisor(question: str, thread_id: str = "cli") -> str:
+    """
+    對外主入口：
+    - 使用 thread_id 區分不同對話
+    - LangGraph + MemorySaver 負責維護多輪上下文
+    """
     try:
         final_state = await app.ainvoke(
             {"messages": [HumanMessage(content=question)]},
@@ -619,6 +744,10 @@ async def arun_supervisor(question: str, thread_id: str = "cli") -> str:
 # CLI 測試
 # ================================================================
 async def cli_main():
+    """
+    簡易 CLI 測試介面：
+    - 以 thread_id = 'cli-session' 做多輪測試
+    """
     sid = "cli-session"
     while True:
         text = input("User> ").strip()
